@@ -1,0 +1,649 @@
+#!/usr/bin/env bash
+# =============================================================================
+# fixwifi — Comprehensive WiFi diagnostic script
+# =============================================================================
+
+set -euo pipefail
+
+# ── Colours ──────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
+
+# ── State ─────────────────────────────────────────────────────────────────────
+ISSUES=0
+WARNINGS=0
+IFACE=""
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+header()  { echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════${RESET}"; \
+            echo -e "${BOLD}${CYAN}  $1${RESET}"; \
+            echo -e "${BOLD}${CYAN}══════════════════════════════════════════${RESET}"; }
+section() { echo -e "\n${BOLD}▶ $1${RESET}"; }
+ok()      { echo -e "  ${GREEN}✔${RESET}  $1"; }
+warn()    { echo -e "  ${YELLOW}⚠${RESET}  $1"; WARNINGS=$((WARNINGS+1)); }
+fail()    { echo -e "  ${RED}✘${RESET}  ${BOLD}$1${RESET}"; ISSUES=$((ISSUES+1)); }
+info()    { echo -e "  ${DIM}ℹ${RESET}  $1"; }
+fix()     { echo -e "     ${YELLOW}→ FIX:${RESET} $1"; }
+cmd()     { echo -e "     ${DIM}\$ $1${RESET}"; }
+sep()     { echo -e "  ${DIM}──────────────────────────────────────────${RESET}"; }
+
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}This script must be run as root (use sudo fixwifi)${RESET}"
+        exit 1
+    fi
+}
+
+# ── Detect primary wireless interface ────────────────────────────────────────
+detect_interface() {
+    section "Detecting wireless interface"
+
+    # Prefer the interface that is UP and has an IP
+    IFACE=$(ip -4 addr show | awk '/^[0-9]+: wl/{iface=$2; gsub(/:$/,"",iface)} /inet /{if(iface) {print iface; iface=""; exit}}')
+
+    # Fallback: any wl* interface that is UP
+    if [[ -z "$IFACE" ]]; then
+        IFACE=$(ip link show | awk '/^[0-9]+: wl.*UP/{gsub(/:$/,"",$2); print $2; exit}')
+    fi
+
+    # Fallback: any wl* interface at all
+    if [[ -z "$IFACE" ]]; then
+        IFACE=$(ip link show | awk '/^[0-9]+: wl/{gsub(/:$/,"",$2); print $2; exit}')
+    fi
+
+    if [[ -z "$IFACE" ]]; then
+        fail "No wireless interface found"
+        fix "Check that your WiFi adapter is recognised: lspci | grep -i wireless"
+        exit 1
+    fi
+
+    ok "Wireless interface: ${BOLD}$IFACE${RESET}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 1 — Interface state
+# ─────────────────────────────────────────────────────────────────────────────
+check_interface_state() {
+    section "Interface state"
+
+    local state
+    state=$(ip link show "$IFACE" | awk '/state/{for(i=1;i<=NF;i++) if($i=="state") print $(i+1)}')
+
+    case "$state" in
+        UP)   ok "Interface is UP" ;;
+        DOWN) fail "Interface $IFACE is DOWN"
+              fix "Bring it up:"
+              cmd "sudo ip link set $IFACE up"
+              fix "Or via NetworkManager:"
+              cmd "nmcli device connect $IFACE" ;;
+        *)    warn "Interface state is '$state' (expected UP)" ;;
+    esac
+
+    # RF kill check
+    if command -v rfkill &>/dev/null; then
+        local blocked
+        blocked=$(rfkill list wifi 2>/dev/null | grep -c "Soft blocked: yes" || true)
+        if [[ "$blocked" -gt 0 ]]; then
+            fail "WiFi is soft-blocked (rfkill)"
+            fix "Unblock it:"
+            cmd "sudo rfkill unblock wifi"
+        else
+            ok "rfkill: not blocked"
+        fi
+
+        local hblocked
+        hblocked=$(rfkill list wifi 2>/dev/null | grep -c "Hard blocked: yes" || true)
+        if [[ "$hblocked" -gt 0 ]]; then
+            fail "WiFi is hard-blocked (physical switch or BIOS)"
+            fix "Check your laptop's physical WiFi switch or BIOS settings"
+        fi
+    else
+        info "rfkill not installed — skipping kill-switch check"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 2 — Duplicate IPs / dual DHCP client conflict
+# ─────────────────────────────────────────────────────────────────────────────
+check_duplicate_ips() {
+    section "IP address sanity (dual DHCP client check)"
+
+    local ip_count
+    ip_count=$(ip -4 addr show "$IFACE" | grep -c "inet " || true)
+
+    if [[ "$ip_count" -eq 0 ]]; then
+        fail "No IPv4 address assigned to $IFACE"
+        fix "Restart NetworkManager and reconnect:"
+        cmd "sudo systemctl restart NetworkManager"
+    elif [[ "$ip_count" -eq 1 ]]; then
+        ok "Single IPv4 address assigned"
+    else
+        fail "Multiple IPv4 addresses on $IFACE ($ip_count found) — dual DHCP client conflict"
+        info "Addresses found:"
+        ip -4 addr show "$IFACE" | grep "inet " | while read -r line; do
+            echo "     $line"
+        done
+        fix "Remove extra IPs (keep the primary, delete secondary):"
+        # Print delete commands for all but first
+        local first=1
+        while IFS= read -r line; do
+            local addr
+            addr=$(echo "$line" | awk '{print $2}')
+            if [[ $first -eq 1 ]]; then
+                first=0
+            else
+                cmd "sudo ip addr del $addr dev $IFACE"
+            fi
+        done < <(ip -4 addr show "$IFACE" | grep "inet ")
+        fix "Then see 'Conflicting network managers' check below to prevent recurrence"
+    fi
+
+    # IPv6 link-local duplicate check
+    local ll_count
+    ll_count=$(ip -6 addr show "$IFACE" | grep -c "scope link" || true)
+    if [[ "$ll_count" -gt 1 ]]; then
+        warn "Multiple IPv6 link-local addresses ($ll_count) — also a sign of dual DHCP clients"
+    else
+        ok "IPv6 link-local addresses: OK ($ll_count)"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 3 — Conflicting network managers
+# ─────────────────────────────────────────────────────────────────────────────
+check_network_managers() {
+    section "Conflicting network managers"
+
+    local nm_active nd_active iwd_active dhcpcd_active
+
+    nm_active=$(systemctl is-active NetworkManager 2>/dev/null || echo "inactive")
+    nd_active=$(systemctl is-active systemd-networkd 2>/dev/null || echo "inactive")
+    iwd_active=$(systemctl is-active iwd 2>/dev/null || echo "inactive")
+    dhcpcd_active=$(systemctl is-active dhcpcd 2>/dev/null || echo "inactive")
+
+    info "NetworkManager:    $nm_active"
+    info "systemd-networkd:  $nd_active"
+    info "iwd:               $iwd_active"
+    info "dhcpcd:            $dhcpcd_active"
+    sep
+
+    # NetworkManager is the standard — warn if not running
+    if [[ "$nm_active" != "active" ]]; then
+        fail "NetworkManager is not running"
+        fix "Start and enable it:"
+        cmd "sudo systemctl enable --now NetworkManager"
+    else
+        ok "NetworkManager is active"
+    fi
+
+    # systemd-networkd conflict
+    if [[ "$nd_active" == "active" ]]; then
+        # Check if it's actually managing wlan*
+        local nd_manages_wifi=0
+        for f in /etc/systemd/network/*.network; do
+            [[ -f "$f" ]] || continue
+            if grep -qE "Name=wl\*|Name=$IFACE" "$f" 2>/dev/null; then
+                nd_manages_wifi=1
+                break
+            fi
+        done
+
+        if [[ $nd_manages_wifi -eq 1 ]]; then
+            fail "systemd-networkd is active AND has a config matching $IFACE — this causes dual DHCP"
+            fix "Disable systemd-networkd (NetworkManager handles WiFi):"
+            cmd "sudo systemctl disable --now systemd-networkd"
+            cmd "sudo systemctl disable --now systemd-networkd.socket"
+            cmd "sudo systemctl disable --now systemd-networkd-varlink.socket"
+            cmd "sudo systemctl disable --now systemd-networkd-resolve-hook.socket"
+        else
+            warn "systemd-networkd is active but no wlan config found — monitor for issues"
+        fi
+    else
+        ok "systemd-networkd is not active"
+    fi
+
+    # dhcpcd conflict with NM
+    if [[ "$dhcpcd_active" == "active" && "$nm_active" == "active" ]]; then
+        fail "Both dhcpcd and NetworkManager are running — DHCP conflict"
+        fix "Disable dhcpcd (NetworkManager has its own DHCP client):"
+        cmd "sudo systemctl disable --now dhcpcd"
+    fi
+
+    # iwd — only a problem if NM is not configured to use it but both are running
+    if [[ "$iwd_active" == "active" && "$nm_active" == "active" ]]; then
+        local nm_uses_iwd
+        nm_uses_iwd=$(grep -r "wifi.backend=iwd" /etc/NetworkManager/ 2>/dev/null | wc -l || true)
+        if [[ "$nm_uses_iwd" -eq 0 ]]; then
+            warn "Both iwd and NetworkManager are running, but NM is not configured to use iwd — potential conflict"
+            fix "Either configure NM to use iwd as backend, or stop iwd:"
+            cmd "sudo systemctl disable --now iwd"
+        else
+            ok "iwd is active and NM is configured to use it as backend"
+        fi
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 4 — Default route / gateway
+# ─────────────────────────────────────────────────────────────────────────────
+check_routing() {
+    section "Default route and gateway"
+
+    local default_routes
+    default_routes=$(ip route show default | grep "$IFACE" || true)
+    local route_count
+    route_count=$(echo "$default_routes" | grep -c "default" || true)
+
+    if [[ $route_count -eq 0 ]]; then
+        fail "No default route via $IFACE"
+        fix "Reconnect or restart NetworkManager:"
+        cmd "sudo nmcli device reapply $IFACE"
+    elif [[ $route_count -gt 1 ]]; then
+        fail "Multiple default routes via $IFACE ($route_count) — traffic will be unpredictable"
+        echo "$default_routes" | while read -r line; do info "$line"; done
+        fix "Remove duplicate default routes manually:"
+        cmd "sudo ip route del default via <GW> dev $IFACE"
+        fix "Then reconnect:"
+        cmd "sudo nmcli device reapply $IFACE"
+    else
+        ok "Single default route via $IFACE"
+        info "$default_routes"
+    fi
+
+    # Gateway reachability
+    local gw
+    gw=$(ip route show default dev "$IFACE" 2>/dev/null | awk '/default/{print $3}' | head -1)
+    if [[ -n "$gw" ]]; then
+        if ping -c 2 -W 2 "$gw" &>/dev/null; then
+            ok "Gateway $gw is reachable"
+        else
+            fail "Gateway $gw is NOT reachable — layer 2 or association problem"
+            fix "Try reassociating:"
+            cmd "sudo nmcli device disconnect $IFACE && sudo nmcli device connect $IFACE"
+        fi
+    else
+        warn "Could not determine gateway IP for $IFACE"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 5 — DNS
+# ─────────────────────────────────────────────────────────────────────────────
+check_dns() {
+    section "DNS resolution"
+
+    # Check systemd-resolved
+    local resolved_active
+    resolved_active=$(systemctl is-active systemd-resolved 2>/dev/null || echo "inactive")
+    if [[ "$resolved_active" == "active" ]]; then
+        ok "systemd-resolved is running"
+    else
+        fail "systemd-resolved is not running"
+        fix "Start it:"
+        cmd "sudo systemctl enable --now systemd-resolved"
+    fi
+
+    # Check /etc/resolv.conf
+    local resolvconf_target
+    resolvconf_target=$(readlink /etc/resolv.conf 2>/dev/null || echo "not a symlink")
+    if echo "$resolvconf_target" | grep -q "stub-resolv\|systemd"; then
+        ok "/etc/resolv.conf → $resolvconf_target"
+    else
+        warn "/etc/resolv.conf is not pointing to systemd-resolved stub ($resolvconf_target)"
+        fix "Relink it:"
+        cmd "sudo ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf"
+    fi
+
+    # Check interface DNS servers via resolvectl
+    local iface_dns
+    iface_dns=$(resolvectl status "$IFACE" 2>/dev/null | grep "DNS Servers" | awk -F: '{print $2}' | xargs)
+    if [[ -n "$iface_dns" ]]; then
+        ok "Interface DNS servers: $iface_dns"
+    else
+        warn "No DNS servers assigned to $IFACE"
+    fi
+
+    # Check for dangerous public DNS fallback on enterprise networks
+    local fallback_dns
+    fallback_dns=$(resolvectl status 2>/dev/null | grep "Fallback DNS" | head -1)
+    if echo "$fallback_dns" | grep -qE "8\.8\.8\.8|1\.1\.1\.1|9\.9\.9\.9"; then
+        warn "Public DNS fallback configured ($fallback_dns)"
+        warn "Enterprise firewalls often block outbound DNS to public resolvers — this can cause hangs"
+        fix "Clear fallback DNS in /etc/systemd/resolved.conf:"
+        cmd "sudo sed -i 's/^#*FallbackDNS=.*/FallbackDNS=/' /etc/systemd/resolved.conf"
+        cmd "sudo systemctl restart systemd-resolved"
+    else
+        ok "No problematic public DNS fallback configured"
+    fi
+
+    # Actual resolution test
+    local test_host="google.com"
+    if resolvectl query "$test_host" &>/dev/null; then
+        ok "DNS resolution working ($test_host resolved successfully)"
+    else
+        fail "DNS resolution failing for $test_host"
+        fix "Try flushing DNS cache:"
+        cmd "sudo resolvectl flush-caches"
+        fix "If on enterprise network, check that the internal DNS servers are reachable:"
+        cmd "resolvectl status $IFACE"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 6 — Internet connectivity
+# ─────────────────────────────────────────────────────────────────────────────
+check_connectivity() {
+    section "Internet connectivity"
+
+    # ICMP to well-known IPs
+    local icmp_ok=0
+    for target in 8.8.8.8 1.1.1.1 9.9.9.9; do
+        if ping -c 2 -W 3 "$target" &>/dev/null; then
+            ok "ICMP to $target: reachable"
+            icmp_ok=1
+            break
+        fi
+    done
+    [[ $icmp_ok -eq 0 ]] && fail "ICMP to all public IPs failed — no outbound IP connectivity"
+
+    # HTTP connectivity
+    if curl -s --max-time 5 -o /dev/null -w "%{http_code}" http://detectportal.firefox.com/success.txt 2>/dev/null | grep -q "200"; then
+        ok "HTTP connectivity: OK"
+    else
+        fail "HTTP connectivity failing"
+        fix "Check if a captive portal login is required (try opening a browser)"
+        fix "Check if an enterprise proxy is required:"
+        cmd "curl http://wpad/wpad.dat"
+    fi
+
+    # HTTPS connectivity
+    if curl -s --max-time 5 -o /dev/null https://www.google.com 2>/dev/null; then
+        ok "HTTPS connectivity: OK"
+    else
+        fail "HTTPS connectivity failing"
+        fix "Check for TLS interception or proxy requirement on enterprise networks"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 7 — WiFi association quality
+# ─────────────────────────────────────────────────────────────────────────────
+check_wifi_quality() {
+    section "WiFi association and signal quality"
+
+    if ! command -v iwconfig &>/dev/null && ! command -v iw &>/dev/null; then
+        warn "Neither iwconfig nor iw installed — skipping signal quality check"
+        info "Install with: sudo pacman -S iw wireless_tools"
+        return
+    fi
+
+    local ssid signal noise bitrate
+    if command -v iw &>/dev/null; then
+        local iw_out
+        iw_out=$(iw dev "$IFACE" link 2>/dev/null)
+        if echo "$iw_out" | grep -q "Not connected"; then
+            fail "$IFACE is not associated with any access point"
+            fix "Connect to a network:"
+            cmd "nmcli device wifi connect \"SSID\" password \"PASSWORD\""
+            return
+        fi
+        ssid=$(echo "$iw_out"    | awk '/SSID/{print $2}')
+        signal=$(echo "$iw_out"  | awk '/signal/{print $2, $3}')
+        bitrate=$(echo "$iw_out" | awk '/tx bitrate/{print $3, $4}')
+        ok "Associated to SSID: ${BOLD}$ssid${RESET}"
+        info "Signal: $signal   TX Bitrate: $bitrate"
+
+        # Warn on poor signal
+        local sig_dbm
+        sig_dbm=$(echo "$signal" | awk '{print $1}' | tr -d '-')
+        if [[ -n "$sig_dbm" && "$sig_dbm" -gt 75 ]]; then
+            warn "Signal is weak (-${sig_dbm} dBm) — consider moving closer to the AP"
+        elif [[ -n "$sig_dbm" ]]; then
+            ok "Signal strength acceptable (-${sig_dbm} dBm)"
+        fi
+    fi
+
+    # Check for frequent disconnects in journal
+    local disc_count
+    disc_count=$(journalctl -u NetworkManager --since "1 hour ago" 2>/dev/null | grep -c "disconnected\|Deauthenticated\|CTRL-EVENT-DISCONNECTED" || true)
+    if [[ "$disc_count" -gt 3 ]]; then
+        warn "NetworkManager logged $disc_count disconnection events in the last hour"
+        fix "Check full log for details:"
+        cmd "journalctl -u NetworkManager --since '1 hour ago' | grep -i disconnect"
+    else
+        ok "No significant disconnection events in the last hour ($disc_count)"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 8 — Power management (common cause of random drops)
+# ─────────────────────────────────────────────────────────────────────────────
+check_power_management() {
+    section "WiFi power management"
+
+    if ! command -v iw &>/dev/null; then
+        warn "iw not installed — skipping power management check"
+        return
+    fi
+
+    local pm_state
+    pm_state=$(iw dev "$IFACE" get power_save 2>/dev/null | awk '{print $NF}')
+
+    if [[ "$pm_state" == "on" ]]; then
+        warn "WiFi power management is ON — this can cause random drops on enterprise networks"
+        fix "Disable power management now:"
+        cmd "sudo iw dev $IFACE set power_save off"
+        fix "Make it permanent (create udev rule):"
+        cmd "echo 'ACTION==\"add\", SUBSYSTEM==\"net\", KERNEL==\"$IFACE\", RUN+=\"/usr/sbin/iw dev $IFACE set power_save off\"' | sudo tee /etc/udev/rules.d/70-wifi-powersave.rules"
+        fix "Or via NetworkManager config:"
+        cmd "echo -e '[connection]\nwifi.powersave = 2' | sudo tee /etc/NetworkManager/conf.d/wifi-powersave.conf"
+        cmd "sudo systemctl reload NetworkManager"
+    elif [[ "$pm_state" == "off" ]]; then
+        ok "WiFi power management is OFF"
+    else
+        info "Could not determine power management state (got: '$pm_state')"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 9 — DHCP lease health
+# ─────────────────────────────────────────────────────────────────────────────
+check_dhcp_lease() {
+    section "DHCP lease health"
+
+    local valid_lft
+    valid_lft=$(ip -4 addr show "$IFACE" | awk '/valid_lft/{print $2}' | head -1)
+
+    if [[ -z "$valid_lft" || "$valid_lft" == "forever" ]]; then
+        info "DHCP lease: static or no lease info available"
+        return
+    fi
+
+    local lft_sec
+    lft_sec=$(echo "$valid_lft" | tr -d 'sec')
+
+    if [[ "$lft_sec" -lt 120 ]]; then
+        warn "DHCP lease expiring very soon (${lft_sec}s) — renewal may cause a brief drop"
+        fix "Force DHCP renewal:"
+        cmd "sudo nmcli device reapply $IFACE"
+    else
+        ok "DHCP lease valid for ${lft_sec}s"
+    fi
+
+    # Check for lease file conflicts
+    local lease_files
+    lease_files=$(find /var/lib/NetworkManager /var/lib/dhcpcd /var/lib/dhclient -name "*.lease*" 2>/dev/null | grep -i "wl" || true)
+    if [[ -n "$lease_files" ]]; then
+        local lease_count
+        lease_count=$(echo "$lease_files" | wc -l)
+        if [[ $lease_count -gt 1 ]]; then
+            warn "Multiple DHCP lease files found for wireless ($lease_count) — possible leftover from dual clients"
+            info "Files: $lease_files"
+            fix "If systemd-networkd is disabled, its lease files can be removed:"
+            cmd "sudo rm -f /var/lib/systemd/network/*.lease"
+        else
+            ok "DHCP lease files look clean ($lease_count file)"
+        fi
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 10 — Enterprise proxy detection
+# ─────────────────────────────────────────────────────────────────────────────
+check_proxy() {
+    section "Enterprise proxy detection"
+
+    # Check env vars
+    local proxy_set=0
+    for var in http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; do
+        local val="${!var:-}"
+        if [[ -n "$val" ]]; then
+            ok "Proxy env var $var is set: $val"
+            proxy_set=1
+        fi
+    done
+    [[ $proxy_set -eq 0 ]] && info "No proxy environment variables set"
+
+    # Check NM proxy config
+    local nm_proxy
+    nm_proxy=$(nmcli -t -f GENERAL.CONNECTION device show "$IFACE" 2>/dev/null | awk -F: '{print $2}' | head -1)
+    if [[ -n "$nm_proxy" ]]; then
+        local proxy_mode
+        proxy_mode=$(nmcli -t -f proxy.method connection show "$nm_proxy" 2>/dev/null | awk -F: '{print $2}' || true)
+        if [[ "$proxy_mode" == "auto" || "$proxy_mode" == "manual" ]]; then
+            ok "NetworkManager proxy configured: $proxy_mode"
+        fi
+    fi
+
+    # WPAD auto-discovery
+    local gw
+    gw=$(ip route show default dev "$IFACE" 2>/dev/null | awk '{print $3}' | head -1)
+    info "Attempting WPAD proxy auto-discovery..."
+
+    if curl -sf --max-time 3 http://wpad/wpad.dat -o /dev/null 2>/dev/null; then
+        warn "WPAD proxy config found at http://wpad/wpad.dat — your network may require a proxy"
+        fix "Set proxy environment variables:"
+        cmd "export http_proxy=http://proxy.yourcompany.com:PORT"
+        cmd "export https_proxy=http://proxy.yourcompany.com:PORT"
+        fix "Ask IT for the correct proxy address and port"
+    else
+        ok "No WPAD proxy required (or WPAD not advertised)"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 11 — Driver and firmware
+# ─────────────────────────────────────────────────────────────────────────────
+check_driver() {
+    section "WiFi driver and firmware"
+
+    local driver
+    driver=$(readlink /sys/class/net/"$IFACE"/device/driver 2>/dev/null | xargs basename 2>/dev/null || echo "unknown")
+    info "Driver: $driver"
+
+    # Check for firmware errors in dmesg
+    local fw_errors
+    fw_errors=$(dmesg 2>/dev/null | grep -iE "firmware.*failed|$driver.*error|$driver.*failed" | tail -5 || true)
+    if [[ -n "$fw_errors" ]]; then
+        fail "Driver/firmware errors found in dmesg:"
+        echo "$fw_errors" | while IFS= read -r line; do info "$line"; done
+        fix "Install missing firmware:"
+        cmd "sudo pacman -S linux-firmware"
+        fix "Check AUR for driver-specific firmware if needed"
+    else
+        ok "No driver/firmware errors in dmesg"
+    fi
+
+    # Check kernel module
+    if [[ "$driver" != "unknown" ]]; then
+        if lsmod | grep -q "^${driver}"; then
+            ok "Kernel module '$driver' is loaded"
+        else
+            warn "Kernel module '$driver' does not appear to be loaded"
+        fi
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 12 — MTU
+# ─────────────────────────────────────────────────────────────────────────────
+check_mtu() {
+    section "MTU (packet fragmentation)"
+
+    local mtu
+    mtu=$(ip link show "$IFACE" | awk '/mtu/{for(i=1;i<=NF;i++) if($i=="mtu") print $(i+1)}')
+    info "Current MTU: $mtu"
+
+    if [[ "$mtu" -ne 1500 ]]; then
+        warn "MTU is $mtu (standard is 1500) — can cause issues with some enterprise networks"
+        fix "Reset to standard MTU:"
+        cmd "sudo ip link set $IFACE mtu 1500"
+    else
+        ok "MTU is 1500 (standard)"
+    fi
+
+    # Test with a large ping to detect path MTU issues
+    local gw
+    gw=$(ip route show default dev "$IFACE" 2>/dev/null | awk '{print $3}' | head -1)
+    if [[ -n "$gw" ]]; then
+        if ping -c 1 -M do -s 1400 "$gw" &>/dev/null; then
+            ok "Large packet (1400 bytes) to gateway: OK"
+        else
+            warn "Large packets to gateway are being dropped — possible MTU mismatch on the network"
+            fix "Try lowering MTU to 1400 or 1450:"
+            cmd "sudo ip link set $IFACE mtu 1400"
+        fi
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUMMARY
+# ─────────────────────────────────────────────────────────────────────────────
+print_summary() {
+    echo ""
+    echo -e "${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+    echo -e "${BOLD}${CYAN}  SUMMARY${RESET}"
+    echo -e "${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+    echo ""
+
+    if [[ $ISSUES -eq 0 && $WARNINGS -eq 0 ]]; then
+        echo -e "  ${GREEN}${BOLD}All checks passed — no issues found.${RESET}"
+    else
+        if [[ $ISSUES -gt 0 ]]; then
+            echo -e "  ${RED}${BOLD}✘ $ISSUES issue(s) found${RESET} — see FIX suggestions above"
+        fi
+        if [[ $WARNINGS -gt 0 ]]; then
+            echo -e "  ${YELLOW}${BOLD}⚠ $WARNINGS warning(s) found${RESET} — review recommended"
+        fi
+    fi
+
+    echo ""
+    echo -e "  ${DIM}Interface checked: $IFACE${RESET}"
+    echo -e "  ${DIM}Run with sudo for full diagnostics: sudo fixwifi${RESET}"
+    echo ""
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+main() {
+    require_root
+    header "fixwifi — WiFi Diagnostic Tool"
+
+    detect_interface
+    check_interface_state
+    check_duplicate_ips
+    check_network_managers
+    check_routing
+    check_dns
+    check_connectivity
+    check_wifi_quality
+    check_power_management
+    check_dhcp_lease
+    check_proxy
+    check_driver
+    check_mtu
+    print_summary
+}
+
+main "$@"
