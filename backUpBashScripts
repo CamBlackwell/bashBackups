@@ -44,4 +44,4 @@ read -p "Would you like to commit to git? (Y/N): " confirm && [[ $confirm == [yY
 git -C /home/cam/Documents/bashScripts add .  
 read -p "What is your commit description: " desc
 git -C /home/cam/Documents/bashScripts commit -m "$desc"
-git -C /home/cam/Documents/bashScripts push main
+git -C /home/cam/Documents/bashScripts push origin main
