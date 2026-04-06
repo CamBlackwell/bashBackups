@@ -1,0 +1,179 @@
+#!/bin/bash
+
+PIPER_DIR=~/piper
+
+# ── Check piper is installed ──────────────────────────────
+if ! command -v piper &>/dev/null; then
+  echo "piper not found. Install with: yay -S piper-tts"
+  exit 1
+fi
+
+# ── Model picker ──────────────────────────────────────────
+pick_model() {
+  models=(~/models/*.gguf)
+  echo ""
+  echo "Select a model:"
+  for i in "${!models[@]}"; do
+    echo "  $((i+1))) $(basename ${models[$i]})"
+  done
+  while true; do
+    read -p "Enter number (1-${#models[@]}): " choice < /dev/tty
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#models[@]}" ]; then
+      break
+    fi
+    echo "Please enter a valid number"
+  done
+  CHOSEN_MODEL="${models[$((choice-1))]}"
+}
+
+# ── Voice picker ──────────────────────────────────────────
+pick_voice() {
+  voices=($PIPER_DIR/*.onnx)
+  if [ ${#voices[@]} -eq 0 ]; then
+    echo "No voices found in ~/piper/ - download some first"
+    exit 1
+  fi
+  echo ""
+  echo "Select a voice:"
+  for i in "${!voices[@]}"; do
+    echo "  $((i+1))) $(basename ${voices[$i]} .onnx)"
+  done
+  read -p "Enter number (default 1): " vchoice < /dev/tty
+  vchoice=${vchoice:-1}
+  CHOSEN_VOICE="${voices[$((vchoice-1))]}"
+}
+
+# ── TTS runner ────────────────────────────────────────────
+run_tts() {
+  local input="$1"
+  echo ""
+  echo "Output:"
+  echo "  1) Play directly"
+  echo "  2) Save to file"
+  read -p "Enter number (default 1): " outchoice < /dev/tty
+  outchoice=${outchoice:-1}
+
+  if [ "$outchoice" = "2" ]; then
+    read -p "Save as (e.g. output.wav): " outfile < /dev/tty
+    cat "$input" | piper \
+      --model "$CHOSEN_VOICE" \
+      --output_file "$outfile"
+    echo "Saved to $outfile"
+  else
+    cat "$input" | piper \
+      --model "$CHOSEN_VOICE" \
+      --output_raw | aplay -r 22050 -f S16_LE -t raw - 2>/dev/null
+  fi
+}
+
+# ── Main menu ─────────────────────────────────────────────
+echo "┌─────────────────────────┐"
+echo "│       speak / TTS       │"
+echo "├─────────────────────────┤"
+echo "│  1) Read a file         │"
+echo "│  2) Type text           │"
+echo "│  3) AI conversation     │"
+echo "└─────────────────────────┘"
+read -p "Choose mode: " mode < /dev/tty
+
+pick_voice
+export CHOSEN_VOICE
+
+case $mode in
+  1)
+    read -p "File path: " filepath < /dev/tty
+    if [ ! -f "$filepath" ]; then
+      echo "File not found: $filepath"
+      exit 1
+    fi
+    if [[ "$filepath" == *.pdf ]]; then
+      if ! command -v pdftotext &>/dev/null; then
+        echo "pdftotext not found. Install with: sudo pacman -S poppler"
+        exit 1
+      fi
+      tmpfile=$(mktemp /tmp/speak_XXXX.txt)
+      trap "rm -f $tmpfile" EXIT
+      pdftotext "$filepath" "$tmpfile"
+      run_tts "$tmpfile"
+    else
+      run_tts "$filepath"
+    fi
+    ;;
+  2)
+    echo "Type your text (Ctrl+D when done):"
+    tmpfile=$(mktemp /tmp/speak_XXXX.txt)
+    trap "rm -f $tmpfile" EXIT
+    cat > "$tmpfile" < /dev/tty
+    run_tts "$tmpfile"
+    ;;
+ 3)
+    pick_model
+    export CHOSEN_VOICE
+    echo ""
+    echo "Starting server..."
+
+    # Start llama-server in background
+    ~/llama.cpp/build/bin/llama-server \
+      -m "$CHOSEN_MODEL" \
+      --gpu-layers 20 \
+      --port 8080 \
+      --log-disable > /dev/null 2>&1 &
+    SERVER_PID=$!
+    trap "kill $SERVER_PID 2>/dev/null" EXIT
+
+    # Wait for server to be ready
+    sleep 3
+
+    echo "AI conversation mode. Type 'exit' to quit."
+    messages="[]"
+
+    while true; do
+      echo ""
+      read -p "You: " prompt < /dev/tty
+      [ "$prompt" = "exit" ] && break
+      [ -z "$prompt" ] && continue
+
+      # Add user message
+      messages=$(echo "$messages" | python3 -c "
+import json, sys
+msgs = json.load(sys.stdin)
+msgs.append({'role': 'user', 'content': '''$prompt'''})
+print(json.dumps(msgs))
+")
+
+      # Send to server
+      response=$(curl -s http://localhost:8080/v1/chat/completions \
+        -H "Content-Type: application/json" \
+        -d "{\"messages\": $messages, \"max_tokens\": 500}" | \
+        python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(data['choices'][0]['message']['content'])
+")
+
+      # Add assistant response to history
+      messages=$(echo "$messages" | python3 -c "
+import json, sys
+msgs = json.load(sys.stdin)
+msgs.append({'role': 'assistant', 'content': '''$response'''})
+print(json.dumps(msgs))
+")
+
+      # Print and speak
+      echo ""
+      echo "AI: $response"
+      echo "$response" | while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        echo "$line" | piper \
+          --model "$CHOSEN_VOICE" \
+          --output_raw 2>/dev/null | aplay -r 22050 -f S16_LE -t raw - 2>/dev/null
+      done
+    done
+
+    kill $SERVER_PID 2>/dev/null
+    ;;
+  *)
+    echo "Invalid choice"
+    exit 1
+    ;;
+esac

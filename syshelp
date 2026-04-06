@@ -1,0 +1,60 @@
+#!/bin/bash
+
+# Pick a model
+models=(~/models/*.gguf)
+echo "Select a model:"
+for i in "${!models[@]}"; do
+  echo "  $((i+1))) $(basename ${models[$i]})"
+done
+read -p "Enter number (default 1): " choice < /dev/tty
+choice=${choice:-1}
+model="${models[$((choice-1))]}"
+
+# Get the question
+if [ -t 0 ]; then
+  read -p "Question: " question < /dev/tty
+else
+  question=$(cat)
+fi
+
+echo ""
+echo "Searching the web..."
+
+# DuckDuckGo instant answer API (no key needed)
+search_results=$(curl -s "https://api.duckduckgo.com/?q=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$question arch linux'))")&format=json&no_html=1" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+output = []
+if data.get('AbstractText'):
+    output.append(data['AbstractText'])
+for r in data.get('RelatedTopics', [])[:3]:
+    if isinstance(r, dict) and r.get('Text'):
+        output.append(r['Text'])
+print('\n'.join(output) if output else 'No results found')
+")
+
+# Build the prompt
+SYSTEM_PROMPT="You are an expert Linux systems administrator specializing in:
+- Arch Linux (pacman, AUR, yay, systemd, makepkg)
+- Omarchy (a curated Arch setup using omarchy bins at ~/.local/share/omarchy/bin)
+- Terminal tools (nvim, zsh, bash, tmux)
+- Troubleshooting missing commands, broken packages, permission errors
+- oneAPI, Vulkan, llama.cpp on Intel hardware
+
+Always give Arch-specific solutions. Prefer pacman over other package managers.
+If a command is not found, check pacman first, then AUR via yay.
+
+Here is relevant web search context for the question:
+$search_results
+
+Answer the following question concisely and accurately:"
+
+echo "Thinking..."
+echo ""
+
+~/llama.cpp/build/bin/llama-cli \
+  -m "$model" \
+  --gpu-layers 20 \
+  -p "$SYSTEM_PROMPT $question" \
+  -n 500 \
+  --no-display-prompt

@@ -1,0 +1,1410 @@
+#!/usr/bin/env bash
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  llama.cpp CLI  ·  v2.1.0
+#  Beautiful terminal interface — chat, piper TTS, help, history
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Configuration ──────────────────────────────────────────────────────────
+readonly VERSION="2.2.0"
+MODELS_DIR="${HOME}/models"
+LLAMA_BIN="${HOME}/llama.cpp/build/bin/llama-cli"
+LLAMA_SERVER="${HOME}/llama.cpp/build/bin/llama-server"
+PIPER_DIR="${HOME}/piper"
+HISTORY_DIR="${HOME}/.llama_history"
+GPU_LAYERS=20
+
+# ── Colors ─────────────────────────────────────────────────────────────────
+RST=$'\033[0m'
+BOLD=$'\033[1m'
+B1=$'\033[38;5;39m'
+B2=$'\033[38;5;27m'
+B3=$'\033[38;5;51m'
+W=$'\033[38;5;255m'
+G=$'\033[38;5;244m'
+D=$'\033[38;5;238m'
+GRN=$'\033[38;5;82m'
+RED=$'\033[38;5;196m'
+YEL=$'\033[38;5;220m'
+
+# ── Terminal utilities ─────────────────────────────────────────────────────
+
+tw() { tput cols 2>/dev/null || echo 80; }
+
+strip_ansi() { printf '%s' "$1" | sed 's/\x1b\[[0-9;:]*[A-Za-z]//g'; }
+vlen()       { local _s; _s=$(strip_ansi "$1"); printf '%s' "${#_s}"; }
+
+center_print() {
+  local text="$1" w; w=$(tw)
+  local vw; vw=$(vlen "$text")
+  local pad=$(( (w - vw) / 2 ))
+  [[ $pad -lt 0 ]] && pad=0
+  printf '%*s%s\n' "$pad" '' "$text"
+}
+
+hr() {
+  local char="${1:-─}" col="${2:-$D}" w; w=$(tw)
+  printf '%s' "$col"
+  printf '%*s' "$w" '' | tr ' ' "${char:0:1}"
+  printf '%s\n' "$RST"
+}
+
+# ── Box drawing  (respects $BOX_WIDTH when set) ────────────────────────────
+
+_bw() { printf '%s' "${BOX_WIDTH:-$(tw)}"; }
+
+box_top() {
+  local title="${1:-}" w; w=$(_bw)
+  local inner=$(( w - 2 ))
+  if [[ -n "$title" ]]; then
+    local tlen; tlen=$(vlen "$title")
+    local lp=$(( (inner - tlen - 2) / 2 ))
+    local rp=$(( inner - tlen - 2 - lp ))
+    [[ $lp -lt 1 ]] && lp=1
+    [[ $rp -lt 1 ]] && rp=1
+    printf '%s╭' "$D"
+    printf '%*s' "$lp" '' | tr ' ' '─'
+    printf ' %s%s%s%s ' "$B1$BOLD" "$title" "$RST$D"
+    printf '%*s' "$rp" '' | tr ' ' '─'
+    printf '╮%s\n' "$RST"
+  else
+    printf '%s╭' "$D"
+    printf '%*s' "$inner" '' | tr ' ' '─'
+    printf '╮%s\n' "$RST"
+  fi
+}
+
+box_bottom() {
+  local w; w=$(_bw)
+  printf '%s╰' "$D"
+  printf '%*s' $(( w - 2 )) '' | tr ' ' '─'
+  printf '╯%s\n' "$RST"
+}
+
+box_empty() {
+  local w; w=$(_bw)
+  printf '%s│%*s│%s\n' "$D" $(( w - 2 )) '' "$RST"
+}
+
+box_line() {
+  local content="$1" w; w=$(_bw)
+  local inner=$(( w - 4 ))
+  local vw; vw=$(vlen "$content")
+  local rp=$(( inner - vw ))
+  [[ $rp -lt 0 ]] && rp=0
+  printf '%s│%s ' "$D" "$RST"
+  printf '%s' "$content"
+  printf '%*s' "$rp" ''
+  printf ' %s│%s\n' "$D" "$RST"
+}
+
+box_div() {
+  local w; w=$(_bw)
+  printf '%s├' "$D"
+  printf '%*s' $(( w - 2 )) '' | tr ' ' '─'
+  printf '┤%s\n' "$RST"
+}
+
+# ── Two-panel renderer ─────────────────────────────────────────────────────
+#  two_panel <left_fn> <right_fn>
+#  Runs each function in a subshell at BOX_WIDTH=half, prints side-by-side.
+
+two_panel() {
+  local half=$(( $(tw) / 2 ))
+
+  local left_out right_out
+  left_out=$(  BOX_WIDTH=$half $1 2>/dev/null )
+  right_out=$( BOX_WIDTH=$half $2 2>/dev/null )
+
+  local -a L R
+  mapfile -t L <<< "$left_out"
+  mapfile -t R <<< "$right_out"
+
+  local max=$(( ${#L[@]} > ${#R[@]} ? ${#L[@]} : ${#R[@]} ))
+
+  for (( i=0; i<max; i++ )); do
+    local lline="${L[$i]:-}"
+    local rline="${R[$i]:-}"
+    local vis; vis=$(vlen "$lline")
+    local pad=$(( half - vis ))
+    [[ $pad -lt 0 ]] && pad=0
+    printf '%s%*s%s\n' "$lline" "$pad" '' "$rline"
+  done
+}
+
+# ── Status messages ────────────────────────────────────────────────────────
+
+ok()   { printf '  %s✓%s  %s%s%s\n' "$GRN" "$RST" "$W"  "$1" "$RST"; }
+err()  { printf '  %s✗%s  %s%s%s\n' "$RED" "$RST" "$W"  "$1" "$RST"; }
+info() { printf '  %s●%s  %s%s%s\n' "$B1"  "$RST" "$G"  "$1" "$RST"; }
+warn() { printf '  %s!%s  %s%s%s\n' "$YEL" "$RST" "$W"  "$1" "$RST"; }
+
+# ── Spinner ────────────────────────────────────────────────────────────────
+
+SPINNER_PID=""
+
+spinner_start() {
+  local msg="${1:-Loading…}"
+  (
+    local i=0
+    local -a frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    while true; do
+      printf '\r  %s%s%s  %s%s%s  ' \
+        "$B1" "${frames[$((i % 10))]}" "$RST" \
+        "$G"  "$msg"                   "$RST"
+      sleep 0.08
+      (( i++ ))
+    done
+  ) &
+  SPINNER_PID=$!
+  disown "$SPINNER_PID" 2>/dev/null
+}
+
+spinner_stop() {
+  if [[ -n "$SPINNER_PID" ]]; then
+    kill "$SPINNER_PID" 2>/dev/null
+    wait "$SPINNER_PID" 2>/dev/null || true
+    SPINNER_PID=""
+    printf '\r%*s\r' "$(tw)" ''
+  fi
+}
+
+# ── Arrow-key navigation ───────────────────────────────────────────────────
+#  arrow_menu "hint" "item 1" "item 2" …  →  $ARROW_RESULT (0-based)
+
+ARROW_RESULT=0
+
+arrow_menu() {
+  local _title="$1"; shift
+  local -a _items=("$@")
+  local _n=${#_items[@]}
+  local _sel=0
+  local _drawn=false
+
+  tput civis 2>/dev/null
+
+  while true; do
+    "$_drawn" && tput cuu $(( _n + 2 )) 2>/dev/null
+    _drawn=true
+
+    printf '  %s%s%s\n\n' "$G" "$_title" "$RST"
+
+    for (( i=0; i<_n; i++ )); do
+      if (( i == _sel )); then
+        printf '  %s%s▶  %s%s\n' "$B1" "$BOLD" "${_items[$i]}" "$RST"
+      else
+        printf '  %s   %s%s\n'   "$D"           "${_items[$i]}" "$RST"
+      fi
+    done
+
+    local _k _seq
+    IFS= read -rsn1 _k </dev/tty
+    if [[ "$_k" == $'\x1b' ]]; then
+      IFS= read -rsn2 -t 0.1 _seq </dev/tty || _seq=""
+      case "$_seq" in
+        '[A') (( _sel > 0      )) && (( _sel-- )) ;;
+        '[B') (( _sel < _n - 1 )) && (( _sel++ )) ;;
+      esac
+    elif [[ -z "$_k" ]]; then
+      break
+    elif [[ "$_k" =~ ^[1-9]$ ]]; then
+      local _num=$(( _k - 1 ))
+      (( _num < _n )) && { _sel=$_num; break; }
+    fi
+  done
+
+  tput cnorm 2>/dev/null
+  ARROW_RESULT=$_sel
+}
+
+# ── Model picker ───────────────────────────────────────────────────────────
+
+CHOSEN_MODEL=""
+
+pick_model() {
+  local -a models
+  mapfile -t models < <(find "$MODELS_DIR" -name '*.gguf' -type f 2>/dev/null | sort)
+
+  if [[ ${#models[@]} -eq 0 ]]; then
+    err "No .gguf models found in ${MODELS_DIR}"
+    echo ""
+    read -rp "  Press Enter to go back…" </dev/tty
+    return 1
+  fi
+
+  echo ""
+
+  if command -v fzf &>/dev/null; then
+    local -a fzf_lines=()
+    for i in "${!models[@]}"; do
+      local sz dt nm
+      sz=$(du -sh "${models[$i]}" 2>/dev/null | cut -f1 || echo '?')
+      dt=$(date -r "${models[$i]}" '+%Y-%m-%d' 2>/dev/null \
+           || stat -c '%y' "${models[$i]}" 2>/dev/null | cut -d' ' -f1 \
+           || echo 'unknown')
+      nm=$(basename "${models[$i]}")
+      fzf_lines+=("$(printf '%3d  %-8s  %s  %s' "$i" "$sz" "$dt" "$nm")")
+    done
+
+    local chosen
+    chosen=$(printf '%s\n' "${fzf_lines[@]}" | \
+      fzf \
+        --prompt="  Model ❯ " \
+        --height=50% \
+        --border=rounded \
+        --border-label=" ◆ Select a Model " \
+        --border-label-pos=3 \
+        --color="border:#1e6fcc,label:#5fb4f5,prompt:#5fb4f5,pointer:#5fb4f5,hl+:#ffffff,bg+:#0a1628,fg+:#c8d8f0" \
+        --pointer="▶" \
+        --layout=reverse \
+        --info=right \
+        --header="$(printf '  %3s  %-8s  %-10s  %s' 'IDX' 'SIZE' 'DATE' 'NAME')" \
+        --preview-window=hidden \
+        --bind="esc:abort" \
+        2>/dev/null) || true
+
+    if [[ -z "$chosen" ]]; then
+      warn "No model selected — going back."
+      return 1
+    fi
+
+    local idx; idx=$(printf '%s' "$chosen" | awk '{print $1}' | tr -d ' ')
+    CHOSEN_MODEL="${models[$idx]}"
+
+  else
+    local -a names=("← Back")
+    for m in "${models[@]}"; do
+      local sz; sz=$(du -sh "$m" 2>/dev/null | cut -f1 || echo '?')
+      names+=("$(basename "$m")  (${sz})")
+    done
+    arrow_menu "↑↓ to move  ·  Enter to select  ·  1 = back" "${names[@]}"
+    if (( ARROW_RESULT == 0 )); then return 1; fi
+    CHOSEN_MODEL="${models[$((ARROW_RESULT - 1))]}"
+  fi
+
+  local nm sz
+  nm=$(basename "$CHOSEN_MODEL")
+  sz=$(du -sh "$CHOSEN_MODEL" 2>/dev/null | cut -f1 || echo '?')
+  echo ""
+  ok "Model: ${B1}${BOLD}${nm}${RST}  ${G}(${sz})${RST}"
+  return 0
+}
+
+# ── Voice picker (piper) ───────────────────────────────────────────────────
+
+CHOSEN_VOICE=""
+
+pick_voice() {
+  local -a voices
+  mapfile -t voices < <(find "$PIPER_DIR" -name '*.onnx' -type f 2>/dev/null | sort)
+
+  if [[ ${#voices[@]} -eq 0 ]]; then
+    err "No .onnx voices found in ${PIPER_DIR}"
+    info "Download voices from: https://github.com/rhasspy/piper/releases"
+    echo ""
+    read -rp "  Press Enter to go back…" </dev/tty
+    return 1
+  fi
+
+  echo ""
+
+  if command -v fzf &>/dev/null; then
+    local -a fzf_lines=()
+    for i in "${!voices[@]}"; do
+      local nm; nm=$(basename "${voices[$i]}" .onnx)
+      fzf_lines+=("$(printf '%3d  %s' "$i" "$nm")")
+    done
+
+    local chosen
+    chosen=$(printf '%s\n' "${fzf_lines[@]}" | \
+      fzf \
+        --prompt="  Voice ❯ " \
+        --height=50% \
+        --border=rounded \
+        --border-label=" ◆ Select a Voice " \
+        --border-label-pos=3 \
+        --color="border:#1e6fcc,label:#5fb4f5,prompt:#5fb4f5,pointer:#5fb4f5,hl+:#ffffff,bg+:#0a1628,fg+:#c8d8f0" \
+        --pointer="▶" \
+        --layout=reverse \
+        --info=right \
+        --bind="esc:abort" \
+        2>/dev/null) || true
+
+    if [[ -z "$chosen" ]]; then
+      warn "No voice selected — going back."
+      return 1
+    fi
+
+    local idx; idx=$(printf '%s' "$chosen" | awk '{print $1}' | tr -d ' ')
+    CHOSEN_VOICE="${voices[$idx]}"
+
+  else
+    local -a names=("← Back")
+    for v in "${voices[@]}"; do
+      names+=("$(basename "$v" .onnx)")
+    done
+    arrow_menu "↑↓ to move  ·  Enter to select  ·  1 = back" "${names[@]}"
+    if (( ARROW_RESULT == 0 )); then return 1; fi
+    CHOSEN_VOICE="${voices[$((ARROW_RESULT - 1))]}"
+  fi
+
+  local vn; vn=$(basename "$CHOSEN_VOICE" .onnx)
+  echo ""
+  ok "Voice: ${B1}${BOLD}${vn}${RST}"
+  return 0
+}
+
+# ── Session info bar ───────────────────────────────────────────────────────
+
+session_bar() {
+  local label="${1:-}" nm ts w
+  w=$(tw)
+  nm="${label:-$(basename "${CHOSEN_MODEL:-none}")}"
+  ts=$(date '+%H:%M:%S')
+
+  local left="  ${B1}◈${RST}  ${W}${nm}${RST}"
+  local right="${G}GPU layers: ${GPU_LAYERS}  ·  ${ts}${RST}  "
+
+  local lw rw gap
+  lw=$(vlen "  ◈  ${nm}")
+  rw=$(vlen "GPU layers: ${GPU_LAYERS}  ·  ${ts}  ")
+  gap=$(( w - lw - rw ))
+  [[ $gap -lt 1 ]] && gap=1
+
+  echo ""
+  hr '─' "$D"
+  printf '%s' "$left"
+  printf '%*s' "$gap" ''
+  printf '%s\n' "$right"
+  hr '─' "$D"
+  echo ""
+}
+
+# ── Dependency check ───────────────────────────────────────────────────────
+#  Sets global DEPS_OK.  Output captured by two_panel — no leading blank line.
+
+DEPS_OK=true
+
+check_deps() {
+  DEPS_OK=true
+  local all_ok=true
+
+  box_top "Dependencies"
+  box_empty
+
+  local ll_label; ll_label=$(printf '%-12s' "llama-server")
+  if [[ -x "$LLAMA_SERVER" ]]; then
+    box_line "${GRN}✓${RST}  ${W}${ll_label}${RST}  ${G}found${RST}"
+  else
+    box_line "${RED}✗${RST}  ${W}${ll_label}${RST}  ${RED}missing${RST}"
+    all_ok=false
+  fi
+
+  for dep in curl python3; do
+    local label; label=$(printf '%-12s' "$dep")
+    local path; path=$(command -v "$dep" 2>/dev/null || true)
+    if [[ -n "$path" ]]; then
+      box_line "${GRN}✓${RST}  ${W}${label}${RST}  ${G}found${RST}"
+    else
+      box_line "${RED}✗${RST}  ${W}${label}${RST}  ${RED}missing${RST}"
+      all_ok=false
+    fi
+  done
+
+  box_div
+
+  for dep in fzf piper aplay pdftotext; do
+    local label; label=$(printf '%-12s' "$dep")
+    local path; path=$(command -v "$dep" 2>/dev/null || true)
+    if [[ -n "$path" ]]; then
+      box_line "${GRN}✓${RST}  ${W}${label}${RST}  ${D}optional${RST}"
+    else
+      box_line "${D}○${RST}  ${G}${label}${RST}  ${D}optional${RST}"
+    fi
+  done
+
+  box_empty
+  box_bottom
+
+  [[ "$all_ok" == false ]] && DEPS_OK=false
+}
+
+# ── System info ────────────────────────────────────────────────────────────
+
+show_sysinfo() {
+  local kernel distro mem_total mem_free cpu gpu model_count hist_count
+
+  kernel=$(uname -r)
+  distro=$(grep -m1 '^NAME' /etc/os-release 2>/dev/null | cut -d'"' -f2 || echo "Linux")
+  mem_total=$(awk '/MemTotal/    {printf "%.1fG", $2/1048576}' /proc/meminfo 2>/dev/null || echo "?")
+  mem_free=$( awk '/MemAvailable/{printf "%.1fG", $2/1048576}' /proc/meminfo 2>/dev/null || echo "?")
+  cpu=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null \
+        | sed 's/.*: //' | tr -s ' ' | cut -c1-36 || echo "unknown")
+  gpu="unknown"
+  command -v lspci &>/dev/null \
+    && gpu=$(lspci 2>/dev/null | grep -im1 'vga\|display\|3d' \
+             | sed 's/.*: //' | cut -c1-36 || echo "unknown")
+  model_count=$(find "$MODELS_DIR" -name '*.gguf' 2>/dev/null | wc -l | tr -d ' ')
+  hist_count=$(find  "$HISTORY_DIR" -name '*.txt'  2>/dev/null | wc -l | tr -d ' ')
+
+  box_top "System"
+  box_empty
+  box_line "  ${G}OS      ${RST}${W}${distro}${RST}"
+  box_line "  ${G}Kernel  ${RST}${W}${kernel}${RST}"
+  box_line "  ${G}CPU     ${RST}${W}${cpu}${RST}"
+  box_line "  ${G}GPU     ${RST}${W}${gpu}${RST}"
+  box_line "  ${G}RAM     ${RST}${W}${mem_free}${G} free / ${mem_total}${RST}"
+  box_div
+  box_line "  ${G}Models  ${RST}${B1}${BOLD}${model_count}${RST}${G} gguf in ${W}${MODELS_DIR}${RST}"
+  box_line "  ${G}History ${RST}${W}${hist_count}${G} sessions in ${W}${HISTORY_DIR}${RST}"
+  box_empty
+  box_bottom
+}
+
+# ── Header ─────────────────────────────────────────────────────────────────
+
+show_header() {
+  clear
+  local w; w=$(tw)
+  echo ""
+  if (( w >= 62 )); then
+    center_print "${B1}${BOLD}██╗     ██╗      █████╗ ███╗   ███╗ █████╗ ${RST}"
+    center_print "${B1}${BOLD}██║     ██║     ██╔══██╗████╗ ████║██╔══██╗${RST}"
+    center_print "${B2}${BOLD}██║     ██║     ███████║██╔████╔██║███████║${RST}"
+    center_print "${B2}${BOLD}██║     ██║     ██╔══██║██║╚██╔╝██║██╔══██║${RST}"
+    center_print "${B3}${BOLD}███████╗███████╗██║  ██║██║ ╚═╝ ██║██║  ██║${RST}"
+    center_print "${B3}${BOLD}╚══════╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝${RST}"
+  elif (( w >= 30 )); then
+    center_print "${B1}${BOLD}◆  LLAMA.CPP  CLI  ◆${RST}"
+  else
+    center_print "${B1}${BOLD}LLAMA${RST}"
+  fi
+  echo ""
+  center_print "${G}llama.cpp terminal interface  ${D}v${VERSION}${RST}"
+  echo ""
+  hr '─' "$D"
+  echo ""
+}
+
+# ── History ────────────────────────────────────────────────────────────────
+
+init_history() { mkdir -p "$HISTORY_DIR"; }
+
+save_history() {
+  local mode="$1" model_path="$2" content="$3"
+  local ts; ts=$(date '+%Y-%m-%d_%H-%M-%S')
+  local file="${HISTORY_DIR}/${ts}_${mode}.txt"
+  {
+    printf '══════════════════════════════════════════\n'
+    printf '  Date:  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf '  Mode:  %s\n' "$mode"
+    printf '  Model: %s\n' "$(basename "$model_path")"
+    printf '══════════════════════════════════════════\n\n'
+    printf '%s\n' "$content"
+  } > "$file"
+}
+
+mode_history() {
+  show_header
+
+  local -a files
+  mapfile -t files < <(ls -t "${HISTORY_DIR}"/*.txt 2>/dev/null || true)
+
+  if [[ ${#files[@]} -eq 0 ]]; then
+    info "No history yet. Run Chat or Help to save a session."
+    echo ""
+    read -rp "  Press Enter to go back…" </dev/tty
+    return
+  fi
+
+  local chosen_file=""
+
+  if command -v fzf &>/dev/null; then
+    chosen_file=$(printf '%s\n' "${files[@]}" | \
+      fzf \
+        --prompt="  History ❯ " \
+        --height=70% \
+        --border=rounded \
+        --border-label=" ◆ Session History " \
+        --color="border:#1e6fcc,label:#5fb4f5,prompt:#5fb4f5,pointer:#5fb4f5,bg+:#0a1628,fg+:#c8d8f0" \
+        --pointer="▶" \
+        --layout=reverse \
+        --preview="cat {}" \
+        --preview-window="right:55%:wrap" \
+        --bind="esc:abort" \
+        2>/dev/null) || true
+  else
+    echo ""
+    local -a names=("← Back")
+    for f in "${files[@]}"; do
+      names+=("$(basename "$f" .txt)")
+    done
+    arrow_menu "↑↓ to move  ·  Enter to select  ·  1 = back" "${names[@]}"
+    if (( ARROW_RESULT == 0 )); then return; fi
+    chosen_file="${files[$((ARROW_RESULT - 1))]}"
+  fi
+
+  if [[ -n "$chosen_file" && -f "$chosen_file" ]]; then
+    clear
+    echo ""
+    hr '─' "$D"
+    cat "$chosen_file"
+    hr '─' "$D"
+    echo ""
+    read -rp "  Press Enter to go back…" </dev/tty
+  fi
+}
+
+# ── Checkbox multi-select menu ─────────────────────────────────────────────
+#  checkbox_menu "title" "item 1" "item 2" …
+#  Result: $CHECKBOX_RESULT  — space-separated 0-based indices of ticked items
+#  Keys: ↑↓ move  ·  Space toggle  ·  Enter confirm  ·  1-9 quick-toggle
+
+CHECKBOX_RESULT=""
+
+checkbox_menu() {
+  local _title="$1"; shift
+  local -a _items=("$@")
+  local _n=${#_items[@]}
+  local _sel=0
+  local -a _ticked=()
+  local _drawn=false
+
+  for (( i=0; i<_n; i++ )); do _ticked[$i]=0; done
+
+  tput civis >/dev/tty 2>/dev/null
+
+  while true; do
+    "$_drawn" && tput cuu $(( _n + 3 )) >/dev/tty 2>/dev/null
+    _drawn=true
+
+    printf '  %s%s%s\n' "$G" "$_title" "$RST" >/dev/tty
+    printf '  %sSpace = toggle  ·  Enter = confirm%s\n\n' "$D" "$RST" >/dev/tty
+
+    for (( i=0; i<_n; i++ )); do
+      local _box _col _arrow
+      if (( _ticked[$i] )); then
+        _box="${GRN}[✓]${RST}"
+      else
+        _box="${D}[ ]${RST}"
+      fi
+      if (( i == _sel )); then
+        _col="${B1}${BOLD}"; _arrow="${B1}▶${RST}"
+      else
+        _col="${W}";         _arrow="  "
+      fi
+      printf '  %s %s  %s%s%s\n' \
+        "${_box}" "${_arrow}" "${_col}" "${_items[$i]}" "${RST}" >/dev/tty
+    done
+
+    local _k _seq
+    IFS= read -rsn1 _k </dev/tty
+    if [[ "$_k" == $'\x1b' ]]; then
+      IFS= read -rsn2 -t 0.1 _seq </dev/tty || _seq=""
+      case "$_seq" in
+        '[A') (( _sel > 0      )) && (( _sel-- )) ;;
+        '[B') (( _sel < _n - 1 )) && (( _sel++ )) ;;
+      esac
+    elif [[ "$_k" == " " ]]; then
+      (( _ticked[_sel] )) && _ticked[$_sel]=0 || _ticked[$_sel]=1
+    elif [[ -z "$_k" ]]; then
+      break
+    elif [[ "$_k" =~ ^[1-9]$ ]]; then
+      local _num=$(( _k - 1 ))
+      if (( _num < _n )); then
+        (( _ticked[_num] )) && _ticked[$_num]=0 || _ticked[$_num]=1
+      fi
+    fi
+  done
+
+  tput cnorm >/dev/tty 2>/dev/null
+
+  CHECKBOX_RESULT=""
+  for (( i=0; i<_n; i++ )); do
+    (( _ticked[$i] )) && CHECKBOX_RESULT+="${i} "
+  done
+  CHECKBOX_RESULT="${CHECKBOX_RESULT% }"
+}
+
+# ── File reader ────────────────────────────────────────────────────────────
+#  _read_file <path>  →  stdout = raw file contents (PDF via pdftotext)
+
+_read_file() {
+  local path="$1"
+  path="${path/#\~/$HOME}"
+  if [[ ! -f "$path" ]]; then
+    warn "File not found: ${path}" >&2; return 1
+  fi
+  if [[ "$path" == *.pdf ]]; then
+    if ! command -v pdftotext &>/dev/null; then
+      warn "pdftotext not found — install poppler:  pacman -S poppler" >&2; return 1
+    fi
+    pdftotext "$path" - 2>/dev/null
+  else
+    cat "$path"
+  fi
+}
+
+# ── Per-file processing ────────────────────────────────────────────────────
+#  _process_file <path>  →  stdout = processed content
+#  Presents a checkbox menu offering any combination of:
+#    0  Raw (no processing)
+#    1  Truncate to ~3000 chars  (token budget)
+#    2  Smart extract            (strip blank lines + comment-only lines)
+#    3  Pre-summarise via llama  (runs a fast summarisation pass first)
+
+_process_file() {
+  local path="$1"
+  local nm; nm=$(basename "$path")
+  local raw
+  raw=$(_read_file "$path") || return 1
+
+  local raw_len=${#raw}
+  local size_hint=""
+  (( raw_len > 3000 )) && size_hint="${YEL} ⚠ ${raw_len} chars${RST}"
+
+  printf '\n  %sProcessing:%s  %s%s%s%s\n' \
+    "$G" "$RST" "$W" "$nm" "$RST" "$size_hint" >/dev/tty
+
+  checkbox_menu \
+    "Choose processing options for  ${B1}${nm}${RST}  (Space to toggle)" \
+    "Raw — inject as-is" \
+    "Truncate to ~3000 chars" \
+    "Smart extract  (strip blank/comment lines)" \
+    "Pre-summarise via llama"
+
+  local content="$raw"
+
+  # Nothing ticked → raw, done
+  [[ -z "$CHECKBOX_RESULT" ]] && { printf '%s' "$content"; return 0; }
+
+  # Smart extract first (cheapest)
+  if [[ " $CHECKBOX_RESULT " == *" 2 "* ]]; then
+    content=$(printf '%s' "$content" \
+      | grep -v '^\s*$' \
+      | grep -v '^\s*//.*$' \
+      | grep -v '^\s*#.*$' \
+      | grep -v '^\s*/\*.*\*/\s*$')
+    printf '  %s✓%s Smart extract applied\n' "$GRN" "$RST" >/dev/tty
+  fi
+
+  # Truncate
+  if [[ " $CHECKBOX_RESULT " == *" 1 "* ]]; then
+    local limit=3000
+    if (( ${#content} > limit )); then
+      content="${content:0:$limit}"$'\n''[... truncated]'
+      printf '  %s✓%s Truncated to %d chars\n' "$GRN" "$RST" "$limit" >/dev/tty
+    else
+      printf '  %s●%s Already under limit (%d chars)\n' "$B1" "$RST" "${#content}" >/dev/tty
+    fi
+  fi
+
+  # Pre-summarise via llama (most expensive, last)
+  if [[ " $CHECKBOX_RESULT " == *" 3 "* ]]; then
+    printf '  %s●%s Pre-summarising…\n' "$B1" "$RST" >/dev/tty
+    local sum_prompt="Summarise the following file concisely, preserving all key logic, functions, classes, and important details.
+File: ${nm}
+
+${content}
+
+Summary:"
+    local tmpout; tmpout=$(mktemp /tmp/llama_sum_XXXX.txt)
+    "$LLAMA_BIN" \
+      -m  "$CHOSEN_MODEL" \
+      --gpu-layers "$GPU_LAYERS" \
+      -p  "$sum_prompt" \
+      -n  600 \
+      --no-display-prompt \
+      --log-disable \
+      < /dev/null \
+      > "$tmpout" 2>/dev/null &
+    local sum_pid=$!
+    spinner_start "Summarising ${nm}…"
+    wait $sum_pid
+    spinner_stop
+    local summary; summary=$(cat "$tmpout"); rm -f "$tmpout"
+    summary=$(printf '%s' "$summary" \
+      | sed '/^\[.*t\/s.*\]$/d' \
+      | sed 's/^[[:space:]]*//')
+    [[ -n "$summary" ]] && content="$summary"
+    printf '  %s✓%s Summary done\n' "$GRN" "$RST" >/dev/tty
+  fi
+
+  printf '%s' "$content"
+}
+
+# ── fzf file picker (reusable) ─────────────────────────────────────────────
+
+_fzf_pick_file() {
+  fzf \
+    --prompt="  Attach file ❯ " \
+    --height=50% \
+    --border=rounded \
+    --border-label=" ◆ Select a file " \
+    --color="border:#1e6fcc,label:#5fb4f5,prompt:#5fb4f5,pointer:#5fb4f5,hl+:#ffffff,bg+:#0a1628,fg+:#c8d8f0" \
+    --pointer="▶" \
+    --layout=reverse \
+    --preview="head -30 {}" \
+    --preview-window="right:40%:wrap" \
+    --bind="esc:abort" \
+    2>/dev/null || true
+}
+
+# ── File attachment loop ────────────────────────────────────────────────────
+#  _pick_files  →  stdout = combined processed file block for prompt injection
+
+_pick_files() {
+  local -a picked=()
+  local combined=""
+
+  # Initial fzf pick
+  if command -v fzf &>/dev/null; then
+    local chosen; chosen=$(_fzf_pick_file)
+    [[ -n "$chosen" ]] && picked+=("$chosen")
+  fi
+
+  # Add-more loop
+  while true; do
+    echo ""
+    if [[ ${#picked[@]} -gt 0 ]]; then
+      printf '  %sAttached:%s\n' "$G" "$RST"
+      for f in "${picked[@]}"; do
+        printf '    %s◈%s  %s%s%s\n' "$B1" "$RST" "$W" "$(basename "$f")" "$RST"
+      done
+      echo ""
+      arrow_menu "Add another file?" \
+        "Done — proceed to message" \
+        "Add by typing path" \
+        "Add with fzf picker"
+    else
+      arrow_menu "Attach a file?" \
+        "No files — send message as-is" \
+        "Add by typing path" \
+        "Add with fzf picker"
+    fi
+
+    case $ARROW_RESULT in
+      0) break ;;
+      1)
+        printf '  %sFile path:%s  ' "$G" "$RST"
+        local typed; IFS= read -r typed </dev/tty
+        typed="${typed/#\~/$HOME}"
+        if [[ -f "$typed" ]]; then
+          picked+=("$typed"); ok "Added: $(basename "$typed")"
+        else
+          err "Not found: ${typed}"
+        fi
+        ;;
+      2)
+        if command -v fzf &>/dev/null; then
+          local chosen; chosen=$(_fzf_pick_file)
+          [[ -n "$chosen" ]] && { picked+=("$chosen"); ok "Added: $(basename "$chosen")"; }
+        else
+          warn "fzf not installed — use 'Add by typing path'."
+        fi
+        ;;
+    esac
+  done
+
+  # Process each file with per-file options, build combined block
+  for f in "${picked[@]}"; do
+    local content
+    content=$(_process_file "$f" 2>/dev/tty) || continue
+    combined+="$(printf '\n<file name="%s">\n%s\n</file>\n' "$(basename "$f")" "$content")"
+  done
+
+  printf '%s' "$combined"
+}
+
+# ── llama-server lifecycle ─────────────────────────────────────────────────
+#  One server instance per session.  Start once, query many times, stop on exit.
+
+SERVER_PORT=18080          # use a high port to avoid collisions
+SERVER_PID_FILE="/tmp/llama_server_$$.pid"
+
+_server_start() {
+  # Kill any leftover server from a previous crashed session
+  _server_stop 2>/dev/null
+
+  spinner_start "Loading model into server…"
+
+  "$LLAMA_SERVER" \
+    -m  "$CHOSEN_MODEL" \
+    --gpu-layers "$GPU_LAYERS" \
+    --port "$SERVER_PORT" \
+    --log-disable \
+    > /dev/null 2>&1 &
+
+  local pid=$!
+  printf '%s' "$pid" > "$SERVER_PID_FILE"
+
+  # Wait until the server is accepting connections (up to 30 s)
+  local waited=0
+  while (( waited < 30 )); do
+    if curl -sf "http://127.0.0.1:${SERVER_PORT}/health" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.5
+    (( waited++ ))
+  done
+
+  spinner_stop
+
+  if (( waited >= 30 )); then
+    err "Server failed to start within 30 seconds."
+    rm -f "$SERVER_PID_FILE"
+    return 1
+  fi
+
+  ok "Model loaded  ${G}(port ${SERVER_PORT})${RST}"
+  return 0
+}
+
+_server_stop() {
+  if [[ -f "$SERVER_PID_FILE" ]]; then
+    local pid; pid=$(cat "$SERVER_PID_FILE")
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null || true
+    rm -f "$SERVER_PID_FILE"
+  fi
+}
+
+# ── llama-server query ─────────────────────────────────────────────────────
+#  _server_query <messages_json> <max_tokens> [system_prompt]
+#  messages_json: JSON array  e.g.  '[{"role":"user","content":"hello"}]'
+#  stdout: assistant reply text only — pure and clean
+
+_server_query() {
+  local messages="$1"
+  local max_tokens="${2:-800}"
+  local system_prompt="${3:-}"
+
+  # Optionally prepend a system message
+  if [[ -n "$system_prompt" ]]; then
+    local sys_escaped
+    sys_escaped=$(printf '%s' "$system_prompt" | python3 -c "
+import json,sys; print(json.dumps(sys.stdin.read()))
+")
+    messages=$(printf '[{"role":"system","content":%s}]' "$sys_escaped" \
+      | python3 -c "
+import json,sys
+sys_msg = json.load(sys.stdin)
+rest    = json.loads('''${messages}''')
+print(json.dumps(sys_msg + rest))
+" 2>/dev/null || printf '%s' "$messages")
+  fi
+
+  local payload
+  payload=$(python3 -c "
+import json, sys
+print(json.dumps({
+  'messages':   json.loads(sys.argv[1]),
+  'max_tokens': int(sys.argv[2]),
+  'stream':     False,
+  'temperature': 0.7,
+}))
+" "$messages" "$max_tokens" 2>/dev/null)
+
+  local raw
+  raw=$(curl -sf \
+    --max-time 120 \
+    -X POST \
+    -H "Content-Type: application/json" \
+    -d "$payload" \
+    "http://127.0.0.1:${SERVER_PORT}/v1/chat/completions" 2>/dev/null)
+
+  if [[ -z "$raw" ]]; then
+    printf '[no response — is the server still running?]'
+    return 1
+  fi
+
+  python3 -c "
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+    print(data['choices'][0]['message']['content'], end='')
+except Exception as e:
+    print('[parse error: ' + str(e) + ']', end='')
+" "$raw"
+}
+
+# ── Chat mode ──────────────────────────────────────────────────────────────
+
+mode_chat() {
+  show_header
+  pick_model || return
+  session_bar
+
+  _server_start || { read -rp "  Press Enter to go back…" </dev/tty; return; }
+  echo ""
+
+  printf '  %s%sConversation%s  %s%s%s\n' \
+    "$W" "$BOLD" "$RST" "$G" "$(basename "$CHOSEN_MODEL")" "$RST"
+  printf '  %sLeave message empty to go back  ·  Ctrl+C to exit%s\n\n' "$D" "$RST"
+  hr '─' "$D"
+  echo ""
+
+  # Piped input shortcut
+  if [[ ! -t 0 ]]; then
+    local piped; piped=$(cat)
+    local msgs
+    msgs=$(python3 -c "
+import json, sys
+print(json.dumps([{'role':'user','content': sys.argv[1]}]))
+" "Review this and explain any issues: ${piped}")
+    spinner_start "Analyzing…"
+    local response; response=$(_server_query "$msgs" 600)
+    spinner_stop
+    echo ""
+    hr '─' "$D"
+    printf '  %s%sAssistant%s\n\n' "$B1" "$BOLD" "$RST"
+    local ww=$(( $(tw) - 4 ))
+    while IFS= read -r line; do printf '  %s\n' "$line"
+    done < <(printf '%s\n' "$response" | fold -s -w "$ww")
+    echo ""
+    hr '─' "$D"
+    _server_stop
+    save_history "chat" "$CHOSEN_MODEL" "$response"
+    info "Session saved to history"
+    echo ""; read -rp "  Press Enter to go back…" </dev/tty
+    return
+  fi
+
+  # ── Interactive loop ───────────────────────────────────────────────────────
+  local messages="[]"
+  local history_log=""
+
+  while true; do
+    echo ""
+    printf '  %s[a]%s attach files   %s[Enter]%s write message   %s[empty]%s go back\n' \
+      "$B1" "$RST" "$B1" "$RST" "$D" "$RST"
+    printf '  %s❯%s  ' "$B1" "$RST"
+
+    local first_char
+    IFS= read -r -n1 first_char </dev/tty
+
+    local file_context=""
+
+    if [[ "$first_char" == "a" || "$first_char" == "A" ]]; then
+      echo ""
+      file_context=$(_pick_files)
+      echo ""
+      printf '  %sMessage:%s\n  %s❯%s  ' "$G" "$RST" "$B1" "$RST"
+      local message; IFS= read -r message </dev/tty
+    else
+      local rest; IFS= read -r rest </dev/tty
+      message="${first_char}${rest}"
+    fi
+
+    # Empty message → save and go back
+    if [[ -z "$message" && -z "$file_context" ]]; then
+      _server_stop
+      [[ -n "$history_log" ]] && {
+        save_history "chat" "$CHOSEN_MODEL" "$history_log"
+        info "Session saved to history"
+        echo ""
+      }
+      read -rp "  Press Enter to go back…" </dev/tty
+      return
+    fi
+
+    # Build content — prepend file context if present
+    local content="$message"
+    [[ -n "$file_context" ]] && \
+      content="$(printf '[attached files]%s\n\nQuestion: %s' "$file_context" "$message")"
+
+    # Append user message to JSON history
+    messages=$(python3 -c "
+import json, sys
+msgs = json.loads(sys.argv[1])
+msgs.append({'role': 'user', 'content': sys.argv[2]})
+print(json.dumps(msgs))
+" "$messages" "$content")
+
+    echo ""
+    spinner_start "Thinking…"
+    local response; response=$(_server_query "$messages" 800)
+    spinner_stop
+
+    # Append assistant reply to JSON history
+    messages=$(python3 -c "
+import json, sys
+msgs = json.loads(sys.argv[1])
+msgs.append({'role': 'assistant', 'content': sys.argv[2]})
+print(json.dumps(msgs))
+" "$messages" "$response")
+
+    echo ""
+    hr '─' "$D"
+    printf '  %s%sAssistant%s\n\n' "$B1" "$BOLD" "$RST"
+    local ww=$(( $(tw) - 4 ))
+    while IFS= read -r line; do
+      printf '  %s\n' "$line"
+    done < <(printf '%s\n' "$response" | fold -s -w "$ww")
+    echo ""
+    hr '─' "$D"
+
+    history_log+="$(printf 'You: %s\nAssistant: %s\n\n' "$message" "$response")"
+  done
+}
+
+# ── Help mode ──────────────────────────────────────────────────────────────
+
+mode_help() {
+  show_header
+  pick_model || return
+  session_bar
+
+  _server_start || { read -rp "  Press Enter to go back…" </dev/tty; return; }
+  echo ""
+
+  local sys_prompt="You are an expert Linux systems administrator specialising in:
+- Arch Linux: pacman, AUR, yay, systemd, makepkg
+- Omarchy: ~/.local/share/omarchy/bin, omarchy-specific configs
+- Terminal tools: nvim, zsh, bash, tmux
+- Troubleshooting: missing commands, broken packages, permission errors
+- Intel hardware: oneAPI, Vulkan, llama.cpp
+Always give Arch-specific solutions. Prefer pacman first, then yay for AUR.
+Answer concisely and accurately."
+
+  while true; do
+    printf '  %s%sQuestion%s  %sArch Linux / sysadmin%s\n' \
+      "$W" "$BOLD" "$RST" "$G" "$RST"
+    printf '  %s(leave empty to go back)%s\n\n' "$D" "$RST"
+    printf '  %s❯%s  ' "$B1" "$RST"
+    local question
+    IFS= read -r question </dev/tty
+
+    if [[ -z "$question" ]]; then
+      _server_stop; return
+    fi
+
+    echo ""
+    spinner_start "Searching the web…"
+    local search_results
+    search_results=$(curl -s --max-time 8 \
+      "https://api.duckduckgo.com/?q=$(python3 -c \
+        "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" \
+        "${question} arch linux")&format=json&no_html=1" \
+      | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    out  = []
+    if data.get('AbstractText'):
+        out.append(data['AbstractText'])
+    for r in data.get('RelatedTopics', [])[:3]:
+        if isinstance(r, dict) and r.get('Text'):
+            out.append(r['Text'])
+    print('\n'.join(out) if out else 'No results found')
+except Exception:
+    print('Search unavailable')
+" 2>/dev/null || printf 'Search unavailable')
+    spinner_stop
+    ok "Web context fetched"
+    echo ""
+
+    # Build message with web context injected into the user turn
+    local user_content
+    user_content="$(printf 'Web search context:\n%s\n\nQuestion: %s' \
+      "$search_results" "$question")"
+
+    local msgs
+    msgs=$(python3 -c "
+import json, sys
+print(json.dumps([{'role': 'user', 'content': sys.argv[1]}]))
+" "$user_content")
+
+    spinner_start "Thinking…"
+    local response
+    response=$(_server_query "$msgs" 600 "$sys_prompt")
+    spinner_stop
+
+    echo ""
+    hr '─' "$D"
+    printf '  %s%sAnswer%s\n\n' "$B1" "$BOLD" "$RST"
+    local ww=$(( $(tw) - 4 ))
+    while IFS= read -r line; do
+      printf '  %s\n' "$line"
+    done < <(printf '%s\n' "$response" | fold -s -w "$ww")
+    echo ""
+    hr '─' "$D"
+
+    save_history "help" "$CHOSEN_MODEL" \
+      "$(printf 'Q: %s\n\nA: %s' "$question" "$response")"
+
+    echo ""
+    printf '  %sAsk another question?%s  %s[Y/n]%s  ' "$G" "$RST" "$B1" "$RST"
+    local again
+    IFS= read -r again </dev/tty
+    echo ""
+    if [[ "$again" =~ ^[Nn]$ ]]; then
+      _server_stop; return
+    fi
+  done
+}
+
+# ── TTS output helper ──────────────────────────────────────────────────────
+#  _tts_run <text-file>   returns 1 if user chose Back
+
+_tts_run() {
+  local input="$1"
+  echo ""
+
+  arrow_menu "Output destination  ·  Ctrl+C to cancel" \
+    "← Back" \
+    "Play directly" \
+    "Save to file"
+
+  case $ARROW_RESULT in
+    0) return 1 ;;
+    1)
+      echo ""
+      spinner_start "Synthesising speech…"
+      piper \
+        --model "$CHOSEN_VOICE" \
+        --output_raw \
+        < "$input" \
+        2>/dev/null \
+        | aplay -r 22050 -f S16_LE -t raw - 2>/dev/null
+      spinner_stop
+      ok "Playback complete."
+      ;;
+    2)
+      echo ""
+      printf '  %sSave as%s (e.g. output.wav): ' "$G" "$RST"
+      local outfile
+      IFS= read -r outfile </dev/tty
+      if [[ -n "$outfile" ]]; then
+        spinner_start "Rendering to file…"
+        piper \
+          --model "$CHOSEN_VOICE" \
+          --output_file "$outfile" \
+          < "$input" \
+          2>/dev/null
+        spinner_stop
+        ok "Saved to ${W}${outfile}${RST}"
+      else
+        warn "No filename given — cancelled."
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# ── Read / TTS mode (piper) ────────────────────────────────────────────────
+
+mode_read() {
+  show_header
+
+  if ! command -v piper &>/dev/null; then
+    warn "piper not found.  Install with:  yay -S piper-tts"
+    echo ""
+    read -rp "  Press Enter to go back…" </dev/tty
+    return
+  fi
+
+  pick_voice || return
+  session_bar "piper TTS"
+
+  while true; do
+    echo ""
+    arrow_menu "TTS mode  ·  Ctrl+C to exit" \
+      "← Back to main menu" \
+      "Read a file" \
+      "Type text" \
+      "AI conversation  (llama-server + piper)"
+
+    echo ""
+
+    case $ARROW_RESULT in
+
+      0) return ;;
+
+      # ── Read a file ─────────────────────────────────────────────────────
+      1)
+        printf '  %sFile path:%s  ' "$G" "$RST"
+        local filepath
+        IFS= read -r filepath </dev/tty
+        filepath="${filepath/#\~/$HOME}"
+
+        if [[ ! -f "$filepath" ]]; then
+          err "File not found: ${filepath}"
+          echo ""; continue
+        fi
+
+        local tmpfile
+        tmpfile=$(mktemp /tmp/speak_XXXX.txt)
+
+        if [[ "$filepath" == *.pdf ]]; then
+          if ! command -v pdftotext &>/dev/null; then
+            err "pdftotext not found.  Install:  pacman -S poppler"
+            rm -f "$tmpfile"; continue
+          fi
+          spinner_start "Extracting PDF text…"
+          pdftotext "$filepath" "$tmpfile"
+          spinner_stop
+          ok "PDF extracted"
+        else
+          cp "$filepath" "$tmpfile"
+        fi
+
+        _tts_run "$tmpfile"
+        rm -f "$tmpfile"
+        echo ""
+        ;;
+
+      # ── Type text ────────────────────────────────────────────────────────
+      2)
+        printf '  %sType your text%s (Ctrl+D when done):\n\n' "$W" "$RST"
+        local tmpfile
+        tmpfile=$(mktemp /tmp/speak_XXXX.txt)
+        cat > "$tmpfile" </dev/tty
+        echo ""
+        if [[ -s "$tmpfile" ]]; then
+          _tts_run "$tmpfile"
+        else
+          warn "No text entered."
+        fi
+        rm -f "$tmpfile"
+        echo ""
+        ;;
+
+      # ── AI conversation ──────────────────────────────────────────────────
+      3)
+        pick_model || continue
+
+        if [[ ! -x "$LLAMA_SERVER" ]]; then
+          err "llama-server not found at ${LLAMA_SERVER}"
+          echo ""; read -rp "  Press Enter to go back…" </dev/tty
+          continue
+        fi
+
+        session_bar "piper TTS + llama-server"
+        _server_start || { read -rp "  Press Enter to go back…" </dev/tty; continue; }
+
+        echo ""
+        printf '  %s%sAI Conversation%s  %sLeave empty to end%s\n\n' \
+          "$W" "$BOLD" "$RST" "$G" "$RST"
+
+        local tts_messages="[]"
+
+        while true; do
+          printf '  %sYou:%s  ' "$B1" "$RST"
+          local tts_prompt
+          IFS= read -r tts_prompt </dev/tty
+
+          [[ -z "$tts_prompt" ]] && break
+
+          tts_messages=$(python3 -c "
+import json, sys
+msgs = json.loads(sys.argv[1])
+msgs.append({'role': 'user', 'content': sys.argv[2]})
+print(json.dumps(msgs))
+" "$tts_messages" "$tts_prompt")
+
+          spinner_start "Thinking…"
+          local tts_response
+          tts_response=$(_server_query "$tts_messages" 500)
+          spinner_stop
+
+          tts_messages=$(python3 -c "
+import json, sys
+msgs = json.loads(sys.argv[1])
+msgs.append({'role': 'assistant', 'content': sys.argv[2]})
+print(json.dumps(msgs))
+" "$tts_messages" "$tts_response")
+
+          echo ""
+          printf '  %s%sAI:%s\n' "$B1" "$BOLD" "$RST"
+          local ww=$(( $(tw) - 4 ))
+          while IFS= read -r line; do
+            printf '  %s\n' "$line"
+          done < <(printf '%s\n' "$tts_response" | fold -s -w "$ww")
+          echo ""
+
+          # Speak line by line
+          while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            printf '%s\n' "$line" \
+              | piper \
+                  --model "$CHOSEN_VOICE" \
+                  --output_raw \
+                  2>/dev/null \
+              | aplay -r 22050 -f S16_LE -t raw - 2>/dev/null
+          done <<< "$tts_response"
+        done
+
+        _server_stop
+        info "Server stopped."
+        echo ""
+        read -rp "  Press Enter to go back…" </dev/tty
+        ;;
+    esac
+  done
+}
+
+# ── Startup panels ─────────────────────────────────────────────────────────
+
+show_startup_panels() {
+  two_panel check_deps show_sysinfo
+  echo ""
+
+  if [[ "$DEPS_OK" == false ]]; then
+    warn "Some required dependencies are missing."
+    info "Required: llama-cli, curl, python3"
+    info "Optional: fzf  piper  aplay  pdftotext"
+    echo ""
+    printf '  %sContinue anyway?%s  %s[Y/n]%s  ' "$G" "$RST" "$B1" "$RST"
+    local ans
+    IFS= read -r ans </dev/tty
+    echo ""
+    [[ "$ans" =~ ^[Nn]$ ]] && {
+      printf '  %sGoodbye.%s\n\n' "$G" "$RST"
+      exit 0
+    }
+  fi
+}
+
+# ── Main loop ──────────────────────────────────────────────────────────────
+
+main() {
+  init_history
+
+  trap '
+    spinner_stop  2>/dev/null
+    _server_stop  2>/dev/null
+    tput cnorm    2>/dev/null
+    printf "\n  %sInterrupted. Goodbye.%s\n\n" "$G" "$RST"
+    exit 0
+  ' INT TERM
+
+  show_header
+  show_startup_panels
+
+  while true; do
+    show_header
+
+    printf '  %sChoose a mode:%s\n\n' "$G" "$RST"
+
+    arrow_menu \
+      "↑↓ arrows  ·  Enter to confirm  ·  Ctrl+C to exit" \
+      "Chat        Interactive conversation" \
+      "Help        Ask a question + web search" \
+      "Read        Piper text-to-speech" \
+      "History     Browse saved sessions" \
+      "Quit        Exit"
+
+    echo ""
+
+    case $ARROW_RESULT in
+      0) mode_chat    ;;
+      1) mode_help    ;;
+      2) mode_read    ;;
+      3) mode_history ;;
+      4) printf '\n  %sGoodbye.%s\n\n' "$G" "$RST"; exit 0 ;;
+    esac
+  done
+}
+
+main "$@"

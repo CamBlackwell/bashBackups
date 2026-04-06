@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+
+
+echo -e 'Copying /usr/local/bin \n\n'
+ls '/usr/local/bin'
+
+echo -e ' \nto /home/cam/Documents/bashScripts'
+ls '/home/cam/Documents/bashScripts'
+
+
+echo -e ' \n..and /home/cam/.local/bin'
+ls '/home/cam/.local/bin'
+
+echo -e '\n---------------------------------------------------------------------------------------------'
+
+output="$(cp -Ruv /usr/local/bin/* /home/cam/Documents/bashScripts/ 2>/dev/null)" #R = recursive, u = skip files that are identical, v = print each file when copied
+
+if [[ -n "$output" ]]; then
+  echo "Usr/loca/bin Files were copied or updated!"
+  echo "$output"
+else
+  echo "No changes for usr/local/bin"
+fi
+
+output="$(cp -Ruv  /home/cam/.local/bin/* /home/cam/Documents/bashScripts/ 2>/dev/null)" #R = recursive, u = skip files that are identical, v = print each file when copied
+
+if [[ -n "$output" ]]; then
+  echo "/home/cam/.local/bin Files were copied or updated!"
+  echo "$output"
+else
+  echo "No changes for cam/.local/bin"
+fi
+
+echo -e '---------------------------------------------------------------------------------------------\n'
+echo -e '\n\nNow copied /usr/local/bin '
+ls '/usr/local/bin'
+echo -e '\n\nand /usr/.cam/.local/bin '
+ls '/usr/.cam/.local/bin'
+echo -e '\n\nto /home/cam/Documents/bashScripts'
+ls '/home/cam/Documents/bashScripts'
+
+
+read -p "Would you like to commit to git? (Y/N): " confirm && [[ $confirm == [yY] || $confirm == [yY][eE][sS] ]] || exit 1
+git -C /home/cam/Documents/bashScripts add .  
+read -p "What is your commit description: " desc
+git -C /home/cam/Documents/bashScripts commit -m "$desc"
+git -C /home/cam/Documents/bashScripts push origin master
