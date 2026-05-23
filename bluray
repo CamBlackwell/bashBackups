@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# bluray - Optimised Blu-ray remux player for Intel Iris Xe (VA-API)
+# Usage: bluray "path/to/movie"
+# Usage: bluray "/home/cam/Desktop/Movies/Blade Runner (1982)"  <- finds the file inside
+# Usage: bluray "/path/to/movie.mkv"                           <- plays directly
+
+set -euo pipefail
+
+# ── Colours ────────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GRN='\033[0;32m'
+YLW='\033[1;33m'
+BLU='\033[0;34m'
+BLD='\033[1m'
+RST='\033[0m'
+
+# ── Intel iHD VA-API driver ────────────────────────────────────────────────────
+export LIBVA_DRIVER_NAME=iHD
+
+# ── Help ───────────────────────────────────────────────────────────────────────
+usage() {
+  echo -e "${BLD}Usage:${RST} bluray <movie-file-or-folder> [options]"
+  echo ""
+  echo -e "${BLD}Options:${RST}"
+  echo "  --no-hw       Force software decoding (debug)"
+  echo "  --info        Print stream info and exit (no playback)"
+  echo "  --help        Show this help"
+  echo ""
+  echo -e "${BLD}Examples:${RST}"
+  echo "  bluray \"/home/cam/Desktop/Movies/Blade Runner (1982)\""
+  echo "  bluray \"/home/cam/Desktop/Movies/Blade Runner (1982)/movie.mkv\""
+  exit 0
+}
+
+# ── Argument parsing ───────────────────────────────────────────────────────────
+MOVIE_PATH=""
+HW_DECODE=true
+INFO_ONLY=false
+
+for arg in "$@"; do
+  case "$arg" in
+    --no-hw)   HW_DECODE=false ;;
+    --info)    INFO_ONLY=true ;;
+    --help|-h) usage ;;
+    *)         MOVIE_PATH="$arg" ;;
+  esac
+done
+
+if [[ -z "$MOVIE_PATH" ]]; then
+  echo -e "${RED}Error:${RST} No path provided."
+  usage
+fi
+
+# ── Resolve file ───────────────────────────────────────────────────────────────
+resolve_file() {
+  local path="$1"
+
+  # Direct file
+  if [[ -f "$path" ]]; then
+    echo "$path"
+    return
+  fi
+
+  # Directory — find the largest video file inside it
+  if [[ -d "$path" ]]; then
+    local found
+    found=$(find "$path" -maxdepth 2 \
+      \( -iname "*.mkv" -o -iname "*.m2ts" -o -iname "*.mp4" -o -iname "*.avi" \) \
+      -printf '%s\t%p\n' 2>/dev/null \
+      | sort -rn | head -1 | cut -f2-)
+
+    if [[ -n "$found" ]]; then
+      echo "$found"
+      return
+    fi
+  fi
+
+  echo ""
+}
+
+FILE=$(resolve_file "$MOVIE_PATH")
+
+if [[ -z "$FILE" ]]; then
+  echo -e "${RED}Error:${RST} Could not find a video file at: $MOVIE_PATH"
+  exit 1
+fi
+
+echo -e "${BLU}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RST}"
+echo -e "${BLD}  🎬 bluray player${RST}"
+echo -e "${BLU}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RST}"
+echo -e "  ${BLD}File:${RST}    $(basename "$FILE")"
+echo -e "  ${BLD}Size:${RST}    $(du -h "$FILE" | cut -f1)"
+
+# ── Stream info via ffprobe ────────────────────────────────────────────────────
+if command -v ffprobe &>/dev/null; then
+  VIDEO_CODEC=$(ffprobe -v quiet -select_streams v:0 \
+    -show_entries stream=codec_name -of default=nk=1:nw=1 "$FILE" 2>/dev/null || echo "unknown")
+  RESOLUTION=$(ffprobe -v quiet -select_streams v:0 \
+    -show_entries stream=width,height -of csv=p=0 "$FILE" 2>/dev/null | tr ',' 'x' || echo "unknown")
+  BITRATE_RAW=$(ffprobe -v error -show_entries format=bit_rate \
+    -of default=nw=1:nk=1 "$FILE" 2>/dev/null || echo "0")
+  BITRATE_MBPS=$(awk "BEGIN {printf \"%.1f\", $BITRATE_RAW/1000000}")
+  DURATION_S=$(ffprobe -v error -show_entries format=duration \
+    -of default=nw=1:nk=1 "$FILE" 2>/dev/null || echo "0")
+  DURATION_FMT=$(date -ud "@${DURATION_S%.*}" '+%H:%M:%S' 2>/dev/null || echo "unknown")
+  AUDIO_CODEC=$(ffprobe -v quiet -select_streams a:0 \
+    -show_entries stream=codec_name -of default=nk=1:nw=1 "$FILE" 2>/dev/null || echo "unknown")
+
+  echo -e "  ${BLD}Video:${RST}   $VIDEO_CODEC @ $RESOLUTION"
+  echo -e "  ${BLD}Audio:${RST}   $AUDIO_CODEC (primary track)"
+  echo -e "  ${BLD}Bitrate:${RST} ${BITRATE_MBPS} Mbps"
+  echo -e "  ${BLD}Runtime:${RST} $DURATION_FMT"
+
+  # Warn if bitrate is very high
+  if awk "BEGIN {exit !($BITRATE_RAW > 50000000)}"; then
+    echo -e "  ${YLW}⚠  High bitrate (>50 Mbps) — hardware decode strongly recommended${RST}"
+  fi
+fi
+
+echo -e "${BLU}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RST}"
+
+[[ "$INFO_ONLY" == true ]] && exit 0
+
+# ── Check dependencies ─────────────────────────────────────────────────────────
+if ! command -v mpv &>/dev/null; then
+  echo -e "${RED}Error:${RST} mpv is not installed. Run: sudo pacman -S mpv"
+  exit 1
+fi
+
+# ── Build mpv flags ────────────────────────────────────────────────────────────
+MPV_FLAGS=(
+  # Hardware decode via VA-API (Intel iHD)
+  --hwdec=vaapi
+
+  # Cache — large buffer for high-bitrate remux
+  --cache=yes
+  --cache-secs=60
+  --demuxer-max-bytes=512MiB
+  --demuxer-max-back-bytes=128MiB
+
+  # Audio — prefer lossless tracks, fall back gracefully
+  --audio-file-auto=fuzzy
+  --alang=eng,en
+  --slang=eng,en
+
+  # Subtitles
+  --sub-auto=fuzzy
+  --sub-visibility=no          # off by default, toggle with 'v' in player
+
+  # HDR tone mapping (for 4K HDR on SDR display)
+  --tone-mapping=hable
+  --hdr-compute-peak=yes
+
+  # Stats overlay on launch so you can verify hw decode immediately
+  # Press shift+I to toggle off
+  --osd-level=1
+)
+
+if [[ "$HW_DECODE" == false ]]; then
+  echo -e "${YLW}  ⚠  Software decoding forced (--no-hw)${RST}"
+  MPV_FLAGS=(
+    --hwdec=no
+    --cache=yes
+    --cache-secs=60
+    --demuxer-max-bytes=512MiB
+  )
+fi
+
+echo -e "  ${GRN}▶  Launching mpv...${RST}"
+echo -e "  ${BLD}Tip:${RST} Press ${BLD}Shift+I${RST} for stats (confirm VA-API decode), ${BLD}v${RST} for subtitles"
+echo ""
+
+exec mpv "${MPV_FLAGS[@]}" "$FILE"

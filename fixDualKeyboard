@@ -1,0 +1,9 @@
+#!/bin/bash
+echo "Restarting merge-keyboards service..."
+sudo systemctl restart merge-keyboards.service
+
+if systemctl is-active --quiet merge-keyboards.service; then
+    echo "✓ merge-keyboards is running"
+else
+    echo "✗ Failed to start — check: sudo journalctl -u merge-keyboards.service"
+fi
